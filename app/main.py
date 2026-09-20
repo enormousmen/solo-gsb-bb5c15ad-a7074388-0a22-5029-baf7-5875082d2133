@@ -5,6 +5,7 @@ from fastapi import FastAPI, HTTPException
 
 from .allocation import AllocationPlanError, plan_allocation
 from .batch import validate_batch
+from .capacity import CustodyCapacityAuditError, audit_custody_capacity
 from .chunk import ChunkValidateError, validate_chunk
 from .contamination import ContaminationTraceError, trace_contamination
 from .exposure import ExposureAuditError, audit_exposure
@@ -18,6 +19,8 @@ from .models import (
     ChunkValidateResponse,
     ContaminationTraceRequest,
     ContaminationTraceResponse,
+    CustodyCapacityAuditRequest,
+    CustodyCapacityAuditResponse,
     ExposureAuditRequest,
     ExposureAuditResponse,
     HandoverPlanAuditRequest,
@@ -36,7 +39,7 @@ from .validator import validate_events
 app = FastAPI(
     title="封签链校验 API",
     description="用于展品运输交接场景的封签链状态机校验服务",
-    version="1.8.0",
+    version="1.9.0",
 )
 
 
@@ -197,4 +200,24 @@ def contamination_trace(request: ContaminationTraceRequest) -> ContaminationTrac
     try:
         return trace_contamination(request)
     except ContaminationTraceError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post(
+    "/api/v1/seal-chain/custody-capacity-audit",
+    response_model=CustodyCapacityAuditResponse,
+    tags=["seal-chain"],
+    summary="保管容量审计：各保管人同时保管链数超出容量的超限段",
+)
+def custody_capacity_audit(request: CustodyCapacityAuditRequest) -> CustodyCapacityAuditResponse:
+    """逐链复用单链校验（各链结果原样保留在 chains）；仅以 status=ok 的
+    seal/reseal/handover 生成截至 audit_until 的保管人半开持有区间 [start,end)
+    （末个区间延伸至 audit_until）。按保管人扫描各自区间的起止边界，同刻先
+    结束后开始（恰好在边界交接的链在该刻不并发）；并发数超过该保管人容量的
+    区间为超限段，相邻且活跃链集合相同的超限段合并，返回起止、容量、并发数
+    与按字典序排列的 chain_ids，并按保管人汇总超限秒数与并发峰值。
+    缺少容量、容量保管人重复、混用时区或 audit_until 早于任一有效事件时返回 422。"""
+    try:
+        return audit_custody_capacity(request)
+    except CustodyCapacityAuditError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc

@@ -1,6 +1,6 @@
 # 封签链校验 API（Seal Chain Validation）
 
-用于展品运输交接场景的封签链校验服务。客户端提交按时间排列的 **封装 / 交接 / 开封 / 重封** 事件序列，服务按状态机逐事件校验，返回最终保管人、当前封签、逐事件状态及全部违规事件的位置与原因；同时提供**批量封签占用检查**接口，对多条事件链做跨链 `seal_id` 占用冲突检测；提供**离线片段合并重建**接口，将同一 `chain_id` 的多个离线片段按 `event_id` 去重、按 `prev_event_id` 重建唯一序列后再校验；提供**开封暴露审计**接口，以有效开封 / 重封事件推导开封区间，相对授权开窗窗口做区间差，输出未授权暴露时长；提供**交接计划符合性审计**接口，把有效封装 / 重封 / 交接事件提取为实际到任记录，与按序计划节点做保管人相同、顺序不交叉的全局最优匹配；提供**温控责任审计**接口，以有效封装 / 重封 / 交接事件生成保管人半开区间，把按前值保持得到的越界温度区间与保管人区间求交、跨交接点拆分，按保管人汇总高温 / 低温秒数、最大偏差与未归属时长；提供**分段校验**接口，把超长事件链拆成若干段依次校验，段间通过带签名的续传令牌传递状态机状态，结果与整链一次校验完全一致；提供**封签库存分配规划**接口，复用批量校验排除已占用编号后，在"未过期且保管人允许"的候选边上做一对一全局最优分配（最大化满足记录数、最小化过期余量总秒数、按待用记录输入顺序与封签编号字典序确定唯一方案）；并提供**污染传播溯源**接口，以各链有效事件生成保管人持有区间，把同一保管人名下的跨链区间重叠识别为接触，从污染源出发按"源已污染且接触仍在持续的最早时刻"级联计算每条链的最早污染时刻、直接来源与完整传播路径。
+用于展品运输交接场景的封签链校验服务。客户端提交按时间排列的 **封装 / 交接 / 开封 / 重封** 事件序列，服务按状态机逐事件校验，返回最终保管人、当前封签、逐事件状态及全部违规事件的位置与原因；同时提供**批量封签占用检查**接口，对多条事件链做跨链 `seal_id` 占用冲突检测；提供**离线片段合并重建**接口，将同一 `chain_id` 的多个离线片段按 `event_id` 去重、按 `prev_event_id` 重建唯一序列后再校验；提供**开封暴露审计**接口，以有效开封 / 重封事件推导开封区间，相对授权开窗窗口做区间差，输出未授权暴露时长；提供**交接计划符合性审计**接口，把有效封装 / 重封 / 交接事件提取为实际到任记录，与按序计划节点做保管人相同、顺序不交叉的全局最优匹配；提供**温控责任审计**接口，以有效封装 / 重封 / 交接事件生成保管人半开区间，把按前值保持得到的越界温度区间与保管人区间求交、跨交接点拆分，按保管人汇总高温 / 低温秒数、最大偏差与未归属时长；提供**分段校验**接口，把超长事件链拆成若干段依次校验，段间通过带签名的续传令牌传递状态机状态，结果与整链一次校验完全一致；提供**封签库存分配规划**接口，复用批量校验排除已占用编号后，在"未过期且保管人允许"的候选边上做一对一全局最优分配（最大化满足记录数、最小化过期余量总秒数、按待用记录输入顺序与封签编号字典序确定唯一方案）；并提供**污染传播溯源**接口，以各链有效事件生成保管人持有区间，把同一保管人名下的跨链区间重叠识别为接触，从污染源出发按"源已污染且接触仍在持续的最早时刻"级联计算每条链的最早污染时刻、直接来源与完整传播路径；并提供**保管容量审计**接口，以各链有效事件生成截至审计截止时间的保管人半开持有区间，按保管人扫描起止边界（同刻先结束后开始）找出并发数超过容量的时间段，合并相邻且活跃链集合相同的超限段后返回分段明细与按保管人汇总的超限秒数及并发峰值。
 
 ## 校验规则（状态机）
 
@@ -957,6 +957,151 @@ curl -s http://localhost:8000/api/v1/seal-chain/contamination-trace \
 # chain-b 在 10:00 被污染，path = ["chain-a", "chain-b"]
 ```
 
+### `POST /api/v1/seal-chain/custody-capacity-audit`
+
+保管容量审计。在单链状态机校验的基础上，回答"**每个保管人在哪些时间段同时保管的展品链数超过了其容量、超出多少**"。处理分四步：
+
+1. **逐链复用单链校验**：对请求中的 `chains` 分别执行与 `/validate` 完全相同的校验，各链原校验结果（附 `chain_id`）原样保留在响应 `chains` 中；
+2. **生成截至 `audit_until` 的保管人持有区间**：仅以各链 `status = ok` 的 **seal / reseal / handover** 事件——每个有效事件以其时间戳开启对应保管人的半开区间 `[start, end)`，下一个有效事件闭合前一区间，末个区间向右延伸至 `audit_until`；unseal 不改变保管人，违规事件一律不产生区间；
+3. **按保管人扫描起止边界**：同一时刻的边界**先处理结束、再处理开始**（半开区间语义：恰好在同一刻交接的两条链在该刻不并发）。相邻两个边界之间活跃链集合恒定，活跃链数**严格大于**该保管人 `capacity` 的时间段即为一个超限段；
+4. **合并与汇总**：相邻且活跃链集合完全相同的超限段合并为一段；返回每段的起止、容量、并发数与按字典序排列的 `chain_ids`，并按保管人汇总超限总秒数与超限段内的并发峰值（仅包含存在超限段的保管人）。
+
+- `chains[]`：事件链，结构同 `/batch-validate`；`chain_id` 不可重复（重复返回 `422`），允许空列表
+- `capacities[]`：各保管人的并发容量，`capacity` 必须为**正整数**，保管人在同一请求内**不可重复**；**任何产生非空持有区间的保管人都必须配置容量，缺少容量返回 `422`**（仅出现在违规事件中的保管人无需配置；为从未持有链的保管人配置容量是允许的）
+- `audit_until`：审计截止时间；**早于任一有效事件时间时返回 `422`**（违规事件不推进有效时间基准）；恰好等于最后一个有效事件时间时末个区间退化为零长度并丢弃
+- 事件与 `audit_until` 的时间不得混用带时区与不带时区的时间（否则 `422`）；链本身存在状态机违规**不影响**本接口返回 `200`，违规只体现在 `chains` 的各链校验结果中
+
+**请求体**
+
+```json
+{
+  "chains": [
+    {
+      "chain_id": "chain-a",
+      "events": [
+        {"type": "seal", "timestamp": "2026-09-20T08:00:00Z", "seal_id": "S001", "custodian": "Alice"},
+        {"type": "handover", "timestamp": "2026-09-20T12:00:00Z", "custodian": "Bob"}
+      ]
+    },
+    {
+      "chain_id": "chain-b",
+      "events": [
+        {"type": "seal", "timestamp": "2026-09-20T09:00:00Z", "seal_id": "S002", "custodian": "Alice"}
+      ]
+    },
+    {
+      "chain_id": "chain-c",
+      "events": [
+        {"type": "seal", "timestamp": "2026-09-20T10:00:00Z", "seal_id": "S003", "custodian": "Alice"}
+      ]
+    }
+  ],
+  "capacities": [
+    {"custodian": "Alice", "capacity": 2},
+    {"custodian": "Bob", "capacity": 1}
+  ],
+  "audit_until": "2026-09-20T20:00:00Z"
+}
+```
+
+**响应示例**（对应上例：Alice 名下 08–09 并发 1、09–10 并发 2 均未超容量，10:00–12:00 三条链同时在管、并发 3 > 容量 2，超限 7200 秒；12:00 起 chain-a 交给 Bob，Alice 名下恢复为 2 条；Bob 始终只有 1 条不超限）
+
+```json
+{
+  "audit_until": "2026-09-20T20:00:00Z",
+  "chains": [
+    {
+      "chain_id": "chain-a",
+      "valid": true,
+      "sealed": true,
+      "final_custodian": "Bob",
+      "current_seal": "S001",
+      "events": [
+        {"index": 0, "type": "seal", "status": "ok", "reason": null, "cross_chain_conflict": false},
+        {"index": 1, "type": "handover", "status": "ok", "reason": null, "cross_chain_conflict": false}
+      ],
+      "violations": []
+    },
+    {
+      "chain_id": "chain-b",
+      "valid": true,
+      "sealed": true,
+      "final_custodian": "Alice",
+      "current_seal": "S002",
+      "events": [
+        {"index": 0, "type": "seal", "status": "ok", "reason": null, "cross_chain_conflict": false}
+      ],
+      "violations": []
+    },
+    {
+      "chain_id": "chain-c",
+      "valid": true,
+      "sealed": true,
+      "final_custodian": "Alice",
+      "current_seal": "S003",
+      "events": [
+        {"index": 0, "type": "seal", "status": "ok", "reason": null, "cross_chain_conflict": false}
+      ],
+      "violations": []
+    }
+  ],
+  "segments": [
+    {
+      "custodian": "Alice",
+      "start": "2026-09-20T10:00:00Z",
+      "end": "2026-09-20T12:00:00Z",
+      "seconds": 7200.0,
+      "capacity": 2,
+      "concurrency": 3,
+      "chain_ids": ["chain-a", "chain-b", "chain-c"]
+    }
+  ],
+  "custodians": [
+    {"custodian": "Alice", "capacity": 2, "overrun_seconds": 7200.0, "peak_concurrency": 3}
+  ]
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `audit_until` | 回显请求中的审计截止时间 |
+| `chains[]` | 各链原单链校验结果（结构同 `/validate`，附 `chain_id`），按**输入顺序**返回；审计仅采用其中 `status=ok` 的 seal/reseal/handover |
+| `segments[]` | 超限分段（半开区间），先按保管人字典序、保管人内按时间升序；相邻且活跃链集合相同的段已合并 |
+| `segments[].chain_ids` | 该段内正在该保管人名下的链标识，按 `chain_id` 字典序排列 |
+| `segments[].concurrency` | 该段实际并发链数，严格大于 `capacity` |
+| `custodians[]` | 按保管人汇总：`overrun_seconds` 为该保管人全部超限段秒数之和，`peak_concurrency` 为超限段内的并发峰值；按保管人字典序排列，仅包含存在超限段的保管人 |
+
+### 保管容量审计接口示例调用
+
+```bash
+curl -s http://localhost:8000/api/v1/seal-chain/custody-capacity-audit \
+  -H 'Content-Type: application/json' \
+  -d '{"chains": [
+        {"chain_id": "chain-a", "events": [
+          {"type": "seal", "timestamp": "2026-09-20T08:00:00Z",
+           "seal_id": "S001", "custodian": "Alice"},
+          {"type": "handover", "timestamp": "2026-09-20T12:00:00Z",
+           "custodian": "Bob"}
+        ]},
+        {"chain_id": "chain-b", "events": [
+          {"type": "seal", "timestamp": "2026-09-20T09:00:00Z",
+           "seal_id": "S002", "custodian": "Alice"}
+        ]},
+        {"chain_id": "chain-c", "events": [
+          {"type": "seal", "timestamp": "2026-09-20T10:00:00Z",
+           "seal_id": "S003", "custodian": "Alice"}
+        ]}
+      ],
+      "capacities": [{"custodian": "Alice", "capacity": 2},
+                     {"custodian": "Bob", "capacity": 1}],
+      "audit_until": "2026-09-20T20:00:00Z"}'
+# Alice 名下 10:00-12:00 并发 3 > 容量 2：segments[0] 为 [10:00,12:00)，
+# concurrency=3，chain_ids=["chain-a","chain-b","chain-c"]，超限 7200 秒
+#
+# 常见 422：缺少容量（"缺少保管人容量配置"）、保管人容量重复、
+# 容量非正整数、混用时区、audit_until 早于最后一个有效事件
+```
+
 > 服务默认监听宿主机 **8000** 端口（容器内固定 `0.0.0.0:8000`，可用 `HOST_PORT` 覆盖），以上示例中的 `http://localhost:8000` 即该端口。
 
 ## 本地开发与测试
@@ -972,7 +1117,7 @@ uvicorn app.main:app --reload --port 8000
 ```
 app/
   main.py        # FastAPI 入口与路由
-  models.py      # 请求 / 响应模型（单链、批量、合并重建、开封暴露审计、交接计划审计、温控责任审计、分段校验、库存分配规划与污染传播溯源）
+  models.py      # 请求 / 响应模型（单链、批量、合并重建、开封暴露审计、交接计划审计、温控责任审计、分段校验、库存分配规划、污染传播溯源与保管容量审计）
   validator.py   # 单链状态机校验核心
   timeline.py    # 时间线公共层（status=ok 事件过滤并保留全链下标 / 半开区间 covered-gap 分割 / 时区可比性检查）
   batch.py       # 批量封签占用检查（跨链冲突）
@@ -983,6 +1128,7 @@ app/
   chunk.py       # 分段校验（续传令牌签发 / 验签 / 状态还原）
   allocation.py  # 封签库存分配规划（占用排除 / 候选边 / 全局最优分配动态规划）
   contamination.py # 污染传播溯源（保管人持有区间 / 接触识别 / 级联最早污染时刻与传播路径，复用 timeline 公共层）
+  capacity.py    # 保管容量审计（持有区间 / 按保管人边界扫描同刻先结束后开始 / 超限段合并与汇总，复用 timeline 公共层）
 tests/
   test_validator.py
   test_batch.py
@@ -994,6 +1140,7 @@ tests/
   test_chunk.py
   test_allocation.py
   test_contamination.py
+  test_capacity.py
 Dockerfile
 docker-compose.yml
 requirements.txt
