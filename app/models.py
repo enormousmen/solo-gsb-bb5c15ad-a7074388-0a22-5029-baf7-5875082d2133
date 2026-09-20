@@ -1,0 +1,721 @@
+"""请求 / 响应数据模型。"""
+from __future__ import annotations
+
+from datetime import datetime
+from enum import Enum
+from typing import List, Optional
+
+from pydantic import BaseModel, Field, model_validator
+
+
+class EventType(str, Enum):
+    """封签链支持的四种事件类型。"""
+
+    SEAL = "seal"          # 封装：首次（或开封后）以封签封装展品
+    HANDOVER = "handover"  # 交接：保管人变更
+    UNSEAL = "unseal"      # 开封：拆除当前封签
+    RESEAL = "reseal"      # 重封：开封后使用新封签重新封装
+
+
+class Event(BaseModel):
+    """单个封签链事件。timestamp 使用 ISO 8601 格式。"""
+
+    type: EventType
+    timestamp: datetime
+    seal_id: Optional[str] = Field(default=None, description="封签编号，seal/reseal 事件必填")
+    custodian: Optional[str] = Field(default=None, description="保管人，seal/reseal/handover 事件必填")
+
+
+class ValidateRequest(BaseModel):
+    """校验请求：按时间排列的事件列表。"""
+
+    events: List[Event] = Field(default_factory=list)
+
+
+class EventResult(BaseModel):
+    """逐事件判定结果。"""
+
+    index: int
+    type: EventType
+    status: str = Field(description="ok 或 violation")
+    reason: Optional[str] = Field(default=None, description="违规原因，status 为 violation 时给出")
+    cross_chain_conflict: bool = Field(
+        default=False,
+        description="该有效 seal/reseal 事件是否与其他链占用同一 seal_id；单链校验接口恒为 false",
+    )
+
+
+class Violation(BaseModel):
+    """违规事件的位置与原因。"""
+
+    index: int
+    reason: str
+
+
+class ValidateResponse(BaseModel):
+    """校验响应。"""
+
+    valid: bool = Field(description="整条链是否无任何违规")
+    sealed: bool = Field(description="处理完所有有效事件后是否处于封装状态")
+    final_custodian: Optional[str] = Field(description="最终保管人")
+    current_seal: Optional[str] = Field(description="当前有效封签编号，未封装时为 null")
+    events: List[EventResult] = Field(description="逐事件状态")
+    violations: List[Violation] = Field(description="所有违规事件的位置与原因")
+
+
+# ---------------------------------------------------------------------------
+# 批量封签占用检查（/api/v1/seal-chain/batch-validate）
+# ---------------------------------------------------------------------------
+
+
+class ChainEvents(BaseModel):
+    """批次中的一条事件链。"""
+
+    chain_id: str = Field(description="链标识，同一批次内不可重复")
+    events: List[Event] = Field(default_factory=list)
+
+
+class BatchValidateRequest(BaseModel):
+    """批量校验请求：按输入顺序排列的多条带 chain_id 的事件链。"""
+
+    chains: List[ChainEvents] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _chain_id_must_be_unique(self) -> "BatchValidateRequest":
+        seen: set[str] = set()
+        for chain in self.chains:
+            if chain.chain_id in seen:
+                raise ValueError(f"批次内 chain_id 不可重复：{chain.chain_id}")
+            seen.add(chain.chain_id)
+        return self
+
+
+class CrossChainConflict(BaseModel):
+    """跨链封签占用冲突项：对应一个被标为 cross_chain_conflict 的事件。"""
+
+    seal_id: str = Field(description="被不同链重复占用的封签编号")
+    chain_id: str = Field(description="冲突事件所属链")
+    event_index: int = Field(description="冲突事件在该链中的下标（从 0 开始）")
+    first_chain_id: str = Field(description="按批次输入顺序首次占用该 seal_id 的链")
+
+
+class BatchChainResult(ValidateResponse):
+    """单链结果：结构与单链校验接口完全一致，另附 chain_id。
+
+    冲突仅会把对应有效事件的 cross_chain_conflict 置为 true，
+    valid / sealed / violations 等各链自身字段不因跨链冲突改变。
+    """
+
+    chain_id: str = Field(description="链标识，回显请求中的 chain_id")
+
+
+class BatchChainSummary(BaseModel):
+    """批次汇总中的单链条目，按 chain_id 稳定排序。"""
+
+    chain_id: str
+    valid: bool = Field(description="该链自身校验是否通过（不受跨链冲突影响）")
+    conflicts: int = Field(description="该链被标为 cross_chain_conflict 的事件数")
+
+
+class BatchValidateResponse(BaseModel):
+    """批量校验响应。"""
+
+    valid: bool = Field(description="批次是否通过：各链均无违规且不存在任何跨链冲突")
+    chains: List[BatchChainResult] = Field(description="各链原校验结果（按输入顺序）")
+    conflicts: List[CrossChainConflict] = Field(
+        default_factory=list,
+        description="跨链封签占用冲突项，按首次占用链输入顺序排列",
+    )
+    summary: List[BatchChainSummary] = Field(
+        default_factory=list,
+        description="按 chain_id 稳定排序的批次汇总",
+    )
+
+
+# ---------------------------------------------------------------------------
+# 离线片段合并重建（/api/v1/seal-chain/reconcile-validate）
+# ---------------------------------------------------------------------------
+
+
+class ReconcileEvent(Event):
+    """离线片段中的事件：在单链事件基础上增加链式标识。"""
+
+    event_id: str = Field(min_length=1, description="事件唯一标识，跨片段判重依据")
+    prev_event_id: Optional[str] = Field(
+        default=None, description="前驱事件标识；null 表示链头事件"
+    )
+
+
+class Fragment(BaseModel):
+    """同一 chain_id 的一个离线片段，其编号为在请求中的下标（从 0 开始）。"""
+
+    events: List[ReconcileEvent] = Field(default_factory=list)
+
+
+class ReconcileRequest(BaseModel):
+    """合并重建请求：同一 chain_id 的多个离线片段。"""
+
+    chain_id: str = Field(description="链标识，所有片段必须属于同一条链")
+    fragments: List[Fragment] = Field(default_factory=list)
+
+
+class EventVariant(BaseModel):
+    """同一 event_id 的一种内容变体及其来源片段。"""
+
+    fragments: List[int] = Field(description="该变体出现的片段编号（从 0 开始，升序去重）")
+    event: ReconcileEvent = Field(description="该变体的事件内容")
+
+
+class EventConflict(BaseModel):
+    """同一 event_id 出现内容分歧时的冲突明细。"""
+
+    event_id: str
+    differing_fields: List[str] = Field(description="各变体间存在分歧的字段名")
+    variants: List[EventVariant] = Field(description="全部内容变体，按首次出现顺序排列")
+
+
+class MissingPredecessor(BaseModel):
+    """缺失前驱：事件的 prev_event_id 在无冲突事件集中不存在。"""
+
+    event_id: str
+    prev_event_id: str
+
+
+class Fork(BaseModel):
+    """分叉：多个事件以同一事件为前驱。"""
+
+    prev_event_id: str
+    event_ids: List[str] = Field(description="以该事件为前驱的全部事件，按首次出现顺序")
+
+
+class StructureReport(BaseModel):
+    """按 prev_event_id 重建唯一序列时的结构诊断（仅基于无冲突事件）。"""
+
+    heads: List[str] = Field(description="prev_event_id 为 null 的链头事件；必须恰好一个")
+    missing_predecessors: List[MissingPredecessor] = Field(
+        default_factory=list, description="前驱不在无冲突事件集中的事件"
+    )
+    forks: List[Fork] = Field(default_factory=list, description="同一前驱被多个事件引用")
+    cycles: List[List[str]] = Field(
+        default_factory=list,
+        description="环：环内每个事件的 prev_event_id 依次指向列表下一事件，末尾指回开头",
+    )
+
+
+class EventSource(BaseModel):
+    """一个 event_id 的来源片段编号列表。"""
+
+    event_id: str
+    fragments: List[int] = Field(description="该事件出现的片段编号（从 0 开始，升序去重）")
+
+
+class ReconcileResponse(BaseModel):
+    """合并重建响应。"""
+
+    chain_id: str = Field(description="链标识，回显请求中的 chain_id")
+    reconciled: bool = Field(
+        description="是否成功重建唯一序列：无内容冲突、恰好一个链头、无缺失前驱、无分叉、无环"
+    )
+    conflicts: List[EventConflict] = Field(
+        default_factory=list, description="按 event_id 判重发现的内容冲突明细"
+    )
+    structure: StructureReport = Field(description="基于无冲突事件的结构诊断")
+    sequence: Optional[List[str]] = Field(
+        description="重建成功时的事件序列（event_id 顺序），否则为 null"
+    )
+    validation: Optional[ValidateResponse] = Field(
+        description="仅重建成功时调用现有单链校验器的结果；index 对应 sequence 中的位置"
+    )
+    event_sources: List[EventSource] = Field(
+        default_factory=list,
+        description="每个 event_id 的来源片段编号列表，按首次出现顺序排列",
+    )
+
+
+# ---------------------------------------------------------------------------
+# 开封暴露审计（/api/v1/seal-chain/exposure-audit）
+# ---------------------------------------------------------------------------
+
+
+class AllowedWindow(BaseModel):
+    """授权开窗窗口：半开时间区间 [start, end)，start 必须严格早于 end。"""
+
+    start: datetime = Field(description="窗口起点（含）")
+    end: datetime = Field(description="窗口终点（不含）")
+
+    @model_validator(mode="after")
+    def _start_before_end(self) -> "AllowedWindow":
+        try:
+            start_before_end = self.start < self.end
+        except TypeError:
+            raise ValueError("窗口起止时间的时区信息不一致（不能混用带时区与不带时区的时间）")
+        if not start_before_end:
+            raise ValueError("allowed_windows 的 start 必须早于 end")
+        return self
+
+
+class ExposureAuditRequest(BaseModel):
+    """开封暴露审计请求：事件序列、审计截止时间与授权开窗窗口。"""
+
+    events: List[Event] = Field(default_factory=list)
+    audit_until: datetime = Field(description="审计截止时间；末次开封未重封时暴露区间延伸至此")
+    allowed_windows: List[AllowedWindow] = Field(
+        default_factory=list,
+        description="授权开窗窗口（半开 [start, end)），允许乱序、嵌套或首尾相接；"
+        "相交或首尾相接的窗口先合并再参与区间差",
+    )
+
+
+class ExposureSegment(BaseModel):
+    """一段（已覆盖或未覆盖的）半开时间区间 [start, end)。"""
+
+    start: datetime
+    end: datetime
+    seconds: float = Field(description="区间时长（秒），等于 end - start")
+    unseal_index: int = Field(description="产生该段的有效开封（unseal）事件下标（从 0 开始）")
+    reseal_index: Optional[int] = Field(
+        description="对应的有效重封（reseal）事件下标；末次开封未重封而延伸至 audit_until 时为 null"
+    )
+
+
+class ExposureAuditResponse(BaseModel):
+    """开封暴露审计响应：保留原单链校验结果，另附区间差明细。"""
+
+    audit_until: datetime = Field(description="回显请求中的审计截止时间")
+    validation: ValidateResponse = Field(
+        description="现有单链校验器的原始结果；仅以其中 status=ok 的 unseal/reseal 推导暴露区间"
+    )
+    covered: List[ExposureSegment] = Field(
+        default_factory=list,
+        description="落在授权窗口内的已覆盖分段（半开区间），按时间升序",
+    )
+    uncovered: List[ExposureSegment] = Field(
+        default_factory=list,
+        description="落在授权窗口外的未覆盖分段（半开区间），按时间升序",
+    )
+    unauthorized_seconds: float = Field(
+        default=0.0, description="未授权暴露总秒数，即全部 uncovered 分段秒数之和"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 超长事件链分段校验（/api/v1/seal-chain/validate-chunk）
+# ---------------------------------------------------------------------------
+
+
+class ChunkValidateRequest(BaseModel):
+    """分段校验请求：首段不带 continuation_token，后续段携带上一响应返回的令牌。"""
+
+    events: List[Event] = Field(default_factory=list, description="本段事件，按时间排列")
+    continuation_token: Optional[str] = Field(
+        default=None,
+        description="上一响应返回的续传令牌（不透明字符串）；首段不传或为 null",
+    )
+
+
+class ChunkSummary(BaseModel):
+    """全链累计摘要（含本段）。"""
+
+    event_count: int = Field(description="全链已累计处理的事件总数（含违规事件）")
+    violation_count: int = Field(description="全链累计违规事件数")
+    valid: bool = Field(description="全链截至目前是否无任何违规")
+    sealed: bool = Field(description="处理完所有有效事件后当前是否处于封装状态")
+    custodian: Optional[str] = Field(description="当前保管人")
+    current_seal: Optional[str] = Field(description="当前有效封签编号，未封装时为 null")
+
+
+class ChunkValidateResponse(BaseModel):
+    """分段校验响应：本段结果 + 全链累计摘要 + 下一段续传令牌。"""
+
+    events: List[EventResult] = Field(
+        description="本段逐事件判定结果；index 为全链偏移（从 0 开始），"
+        "与把所有分段拼接后调用单链接口完全一致"
+    )
+    violations: List[Violation] = Field(
+        description="本段违规事件的位置（全链偏移）与原因"
+    )
+    summary: ChunkSummary = Field(description="全链累计摘要（含本段）")
+    continuation_token: str = Field(
+        description="下一段请求需携带的续传令牌（不透明字符串，带签名）"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 交接计划符合性审计（/api/v1/seal-chain/handover-plan-audit）
+# ---------------------------------------------------------------------------
+
+
+class HandoverPlanNode(BaseModel):
+    """计划节点：某保管人应在半开交接窗口 [window_start, window_end) 内到任。
+
+    窗口为闭起点 / 开终点：window_start <= t < window_end 计为准时；
+    window_start 必须严格早于 window_end。
+    """
+
+    custodian: str = Field(min_length=1, description="计划到任保管人")
+    window_start: datetime = Field(description="计划窗口起点（含）")
+    window_end: datetime = Field(description="计划窗口终点（不含）")
+
+    @model_validator(mode="after")
+    def _start_before_end(self) -> "HandoverPlanNode":
+        try:
+            start_before_end = self.window_start < self.window_end
+        except TypeError:
+            raise ValueError("窗口起止时间的时区信息不一致（不能混用带时区与不带时区的时间）")
+        if not start_before_end:
+            raise ValueError("window_start 必须早于 window_end")
+        return self
+
+
+class HandoverPlanAuditRequest(BaseModel):
+    """交接计划符合性审计请求：事件序列与按顺序排列的计划节点。"""
+
+    events: List[Event] = Field(default_factory=list)
+    plan: List[HandoverPlanNode] = Field(
+        default_factory=list,
+        description="按计划顺序排列的到任节点；匹配必须保持该顺序且不交叉",
+    )
+
+
+class HandoverPlanNodeResult(BaseModel):
+    """单个计划节点的匹配结果。"""
+
+    index: int = Field(description="计划节点下标（从 0 开始，对应请求 plan 中的位置）")
+    custodian: str = Field(description="回显计划保管人")
+    window_start: datetime = Field(description="回显窗口起点")
+    window_end: datetime = Field(description="回显窗口终点")
+    status: str = Field(description="matched（已匹配实际记录）或 missing（无实际到任记录）")
+    event_index: Optional[int] = Field(
+        default=None,
+        description="匹配到的实际记录所在事件下标（从 0 开始，全链下标）；missing 时为 null",
+    )
+    actual_timestamp: Optional[datetime] = Field(
+        default=None, description="匹配事件的实际时间；missing 时为 null"
+    )
+    timing: Optional[str] = Field(
+        default=None,
+        description="实际到任相对窗口的状态：early（早于 window_start）/ "
+        "on_time（window_start <= t < window_end）/ late（不早于 window_end）；missing 时为 null",
+    )
+    deviation_seconds: Optional[float] = Field(
+        default=None,
+        description="实际时间偏离对应窗口的秒数：early 为 window_start - t，"
+        "late 为 t - window_end，on_time 为 0；missing 时为 null",
+    )
+
+
+class UnexpectedArrival(BaseModel):
+    """未被任何计划节点匹配的实际到任记录。"""
+
+    event_index: int = Field(description="该记录在事件链中的下标（从 0 开始）")
+    type: EventType = Field(description="来源事件类型：seal / reseal / handover")
+    timestamp: datetime = Field(description="实际到任时间")
+    custodian: str = Field(description="实际到任保管人")
+
+
+class HandoverPlanSummary(BaseModel):
+    """交接计划符合性审计汇总计数。"""
+
+    matched: int = Field(description="已匹配的计划节点数")
+    missing: int = Field(description="未匹配的计划节点数")
+    unexpected: int = Field(description="未匹配的实际到任记录数")
+    early: int = Field(description="已匹配记录中早到（early）的数量")
+    on_time: int = Field(description="已匹配记录中准时（on_time）的数量")
+    late: int = Field(description="已匹配记录中迟到（late）的数量")
+
+
+class HandoverPlanAuditResponse(BaseModel):
+    """交接计划符合性审计响应：保留原单链校验结果，另附全局最优匹配明细。"""
+
+    validation: ValidateResponse = Field(
+        description="现有单链校验器的原始结果；仅以其中 status=ok 的 seal/reseal/handover "
+        "提取实际到任记录"
+    )
+    plan_results: List[HandoverPlanNodeResult] = Field(
+        description="每个计划节点的匹配结果，按请求 plan 顺序"
+    )
+    unexpected: List[UnexpectedArrival] = Field(
+        default_factory=list,
+        description="未匹配任何计划节点的实际到任记录，按事件下标升序",
+    )
+    summary: HandoverPlanSummary = Field(description="各状态数量汇总")
+
+
+# ---------------------------------------------------------------------------
+# 温控责任审计（/api/v1/seal-chain/temperature-audit）
+# ---------------------------------------------------------------------------
+
+
+class TemperatureSample(BaseModel):
+    """一个温度样本：某时刻的温度读数（摄氏度）。样本时间戳须严格递增。"""
+
+    timestamp: datetime = Field(description="采样时间（ISO 8601）")
+    temperature: float = Field(allow_inf_nan=False, description="温度读数（摄氏度）")
+
+
+class TemperatureAuditRequest(BaseModel):
+    """温控责任审计请求：事件序列、温度样本、允许温度范围与最大采样间隔。"""
+
+    events: List[Event] = Field(default_factory=list)
+    samples: List[TemperatureSample] = Field(
+        default_factory=list,
+        description="温度样本，时间戳必须严格递增；相邻样本间隔不超过 max_gap_seconds 时"
+        "按前值保持形成半开区间 [t_i, t_{i+1})，超出视为数据空洞且不计时",
+    )
+    min_temperature: float = Field(
+        allow_inf_nan=False, description="允许最低温度（含，摄氏度）"
+    )
+    max_temperature: float = Field(
+        allow_inf_nan=False, description="允许最高温度（含，摄氏度）"
+    )
+    max_gap_seconds: float = Field(
+        gt=0,
+        allow_inf_nan=False,
+        description="相邻样本最大间隔（秒），必须为正；间隔超过该值视为数据空洞",
+    )
+
+    @model_validator(mode="after")
+    def _thresholds_ordered(self) -> "TemperatureAuditRequest":
+        if self.min_temperature > self.max_temperature:
+            raise ValueError("min_temperature 不得大于 max_temperature")
+        return self
+
+
+class TemperatureBreachSegment(BaseModel):
+    """一段越界半开区间 [start, end)，已按保管人区间边界（交接点）拆分。
+
+    每段恰好对应一个起始样本（前值保持）；custodian 为 null 表示该段
+    未被任何保管人区间覆盖（未归属）。
+    """
+
+    start: datetime
+    end: datetime
+    seconds: float = Field(description="分段时长（秒），等于 end - start")
+    kind: str = Field(description="high（高温越界）或 low（低温越界）")
+    temperature: float = Field(description="该段前值保持的温度（起始样本读数，摄氏度）")
+    deviation: float = Field(
+        description="越界偏差（摄氏度）：高温为 temperature - max_temperature，"
+        "低温为 min_temperature - temperature"
+    )
+    sample_index: int = Field(description="起始样本在 samples 中的下标（从 0 开始）")
+    custodian: Optional[str] = Field(description="归属保管人；未归属为 null")
+    custodian_event_index: Optional[int] = Field(
+        description="开启归属保管人区间的有效事件下标（全链，从 0 开始）；未归属为 null"
+    )
+
+
+class CustodianTemperatureSummary(BaseModel):
+    """单个保管人的越界时长与最大偏差汇总。"""
+
+    custodian: str
+    high_seconds: float = Field(description="归属该保管人的高温越界总秒数")
+    low_seconds: float = Field(description="归属该保管人的低温越界总秒数")
+    max_high_deviation: Optional[float] = Field(
+        description="高温最大偏差（摄氏度）；无高温越界时为 null"
+    )
+    max_low_deviation: Optional[float] = Field(
+        description="低温最大偏差（摄氏度）；无低温越界时为 null"
+    )
+
+
+class TemperatureMaxDeviation(BaseModel):
+    """全局最大偏差及其溯源信息。"""
+
+    kind: str = Field(description="high（高温越界）或 low（低温越界）")
+    deviation: float = Field(description="最大偏差（摄氏度）")
+    sample_index: int = Field(description="产生该偏差的起始样本下标（从 0 开始）")
+    timestamp: datetime = Field(description="产生该偏差的样本时间")
+
+
+class TemperatureAuditResponse(BaseModel):
+    """温控责任审计响应：保留原单链校验结果，另附越界分段与保管人汇总。"""
+
+    validation: ValidateResponse = Field(
+        description="现有单链校验器的原始结果；仅以其中 status=ok 的 seal/reseal/handover "
+        "生成保管人区间"
+    )
+    segments: List[TemperatureBreachSegment] = Field(
+        default_factory=list,
+        description="越界分段（半开区间），按时间升序；跨交接点已拆分，每段携带起始样本下标",
+    )
+    custodians: List[CustodianTemperatureSummary] = Field(
+        default_factory=list,
+        description="按保管人汇总的高温/低温秒数与各自最大偏差，按首次归属时间升序；"
+        "仅包含有越界时长的保管人",
+    )
+    unattributed_seconds: float = Field(
+        default=0.0, description="未被任何保管人区间覆盖的越界总秒数（未归属时长）"
+    )
+    max_deviation: Optional[TemperatureMaxDeviation] = Field(
+        default=None, description="全局最大偏差及其溯源；无任何越界时为 null"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 封签库存分配规划（/api/v1/seal-chain/allocation-plan）
+# ---------------------------------------------------------------------------
+
+
+class PendingUse(BaseModel):
+    """待用记录：某条链计划由指定保管人在 use_at 时刻使用一枚封签。"""
+
+    chain_id: str = Field(description="待用记录所属链标识（回显用）")
+    custodian: str = Field(min_length=1, description="计划使用封签的保管人")
+    use_at: datetime = Field(description="计划使用时间（ISO 8601）")
+
+
+class InventorySeal(BaseModel):
+    """一枚库存封签：编号、过期时间与允许使用的保管人名单。"""
+
+    seal_id: str = Field(min_length=1, description="库存封签编号，请求内不可重复")
+    expires_at: datetime = Field(
+        description="过期时间；use_at 必须严格早于该时刻，封签才可用"
+    )
+    allowed_custodians: List[str] = Field(
+        default_factory=list,
+        description="允许使用该封签的保管人名单；空列表表示不允许任何保管人",
+    )
+
+
+class AllocationPlanRequest(BaseModel):
+    """封签库存分配规划请求：事件链（复用批量校验）、待用记录与库存封签。"""
+
+    chains: List[ChainEvents] = Field(
+        default_factory=list,
+        description="事件链，结构同批量校验；各链有效 seal/reseal 事件占用的编号不可分配",
+    )
+    pending: List[PendingUse] = Field(
+        default_factory=list, description="待用记录，按输入顺序参与分配"
+    )
+    inventory: List[InventorySeal] = Field(
+        default_factory=list, description="库存封签；seal_id 在请求内不可重复"
+    )
+
+    @model_validator(mode="after")
+    def _ids_must_be_unique(self) -> "AllocationPlanRequest":
+        seen_chains: set[str] = set()
+        for chain in self.chains:
+            if chain.chain_id in seen_chains:
+                raise ValueError(f"批次内 chain_id 不可重复：{chain.chain_id}")
+            seen_chains.add(chain.chain_id)
+        seen_seals: set[str] = set()
+        for seal in self.inventory:
+            if seal.seal_id in seen_seals:
+                raise ValueError(f"库存封签编号不可重复：{seal.seal_id}")
+            seen_seals.add(seal.seal_id)
+        return self
+
+
+class AllocationRecordResult(BaseModel):
+    """单条待用记录的分配结果。"""
+
+    index: int = Field(description="待用记录下标（从 0 开始，对应请求 pending 中的位置）")
+    chain_id: str = Field(description="回显待用记录所属链标识")
+    custodian: str = Field(description="回显计划保管人")
+    use_at: datetime = Field(description="回显计划使用时间")
+    status: str = Field(description="assigned（已分配）或 unassigned（未分配）")
+    seal_id: Optional[str] = Field(
+        default=None, description="分配到的库存封签编号；unassigned 时为 null"
+    )
+    reason: Optional[str] = Field(
+        default=None,
+        description="未分配原因：no_candidate（无任何候选封签）或 "
+        "outcompeted（有候选封签但在全局最优方案中落选）；assigned 时为 null",
+    )
+
+
+class AllocationSummary(BaseModel):
+    """封签库存分配规划汇总。"""
+
+    assigned: int = Field(description="已分配的待用记录数")
+    unassigned: int = Field(description="未分配的待用记录数")
+    no_candidate: int = Field(description="未分配记录中无候选封签的数量")
+    outcompeted: int = Field(description="未分配记录中有候选但竞争淘汰的数量")
+    total_slack_seconds: float = Field(
+        description="全局最优方案的总秒数：已分配边的 Σ(expires_at - use_at)"
+    )
+
+
+class AllocationPlanResponse(BaseModel):
+    """封签库存分配规划响应：保留批量校验结果，另附全局最优分配明细。"""
+
+    batch_validation: BatchValidateResponse = Field(
+        description="复用批量校验的原始结果（结构同 /batch-validate）；"
+        "其中有效 seal/reseal 事件占用的编号不参与分配"
+    )
+    excluded_seal_ids: List[str] = Field(
+        default_factory=list,
+        description="库存中因编号已被有效 seal/reseal 占用而排除的封签编号，按字典序排列",
+    )
+    records: List[AllocationRecordResult] = Field(
+        description="每条待用记录的分配结果，按请求 pending 顺序"
+    )
+    summary: AllocationSummary = Field(description="分配结果汇总")
+
+
+# ---------------------------------------------------------------------------
+# 污染传播溯源（/api/v1/seal-chain/contamination-trace）
+# ---------------------------------------------------------------------------
+
+
+class ContaminationSource(BaseModel):
+    """污染源：某条链的展品自 contaminated_at 起已被污染。"""
+
+    chain_id: str = Field(description="污染源所在链标识，必须出现在 chains 中")
+    contaminated_at: datetime = Field(description="源链展品被污染的时刻（ISO 8601）")
+
+
+class ContaminationTraceRequest(BaseModel):
+    """污染传播溯源请求：多条带 chain_id 的事件链、污染源与审计截止时间。"""
+
+    chains: List[ChainEvents] = Field(
+        default_factory=list,
+        description="事件链，结构同批量校验；chain_id 不可重复",
+    )
+    source: ContaminationSource = Field(description="污染源（chain_id + contaminated_at）")
+    audit_until: datetime = Field(
+        description="审计截止时间；各链末个持有区间延伸至此，"
+        "不得早于任一有效事件时间或 contaminated_at"
+    )
+
+    @model_validator(mode="after")
+    def _chain_id_must_be_unique(self) -> "ContaminationTraceRequest":
+        seen: set[str] = set()
+        for chain in self.chains:
+            if chain.chain_id in seen:
+                raise ValueError(f"批次内 chain_id 不可重复：{chain.chain_id}")
+            seen.add(chain.chain_id)
+        return self
+
+
+class ContaminatedChainResult(BaseModel):
+    """一条被污染链的溯源结果。"""
+
+    chain_id: str = Field(description="被污染链标识")
+    earliest_contaminated_at: datetime = Field(description="该链展品最早被污染的时刻")
+    direct_source: Optional[str] = Field(
+        description="直接来源链标识（同一最早时刻并列时按 chain_id 字典序确定）；"
+        "污染源本身为 null"
+    )
+    path: List[str] = Field(
+        description="完整传播路径：从污染源链到本链的 chain_id 序列（两端均含）"
+    )
+
+
+class ContaminationTraceResponse(BaseModel):
+    """污染传播溯源响应：保留各链单链校验结果，另附级联溯源明细。"""
+
+    audit_until: datetime = Field(description="回显请求中的审计截止时间")
+    source: ContaminationSource = Field(description="回显请求中的污染源")
+    chains: List[BatchChainResult] = Field(
+        description="各链原单链校验结果（按输入顺序，结构同单链接口并附 chain_id）；"
+        "仅以其中 status=ok 的 seal/reseal/handover 生成保管人持有区间"
+    )
+    contaminated: List[ContaminatedChainResult] = Field(
+        default_factory=list,
+        description="被污染的链（含污染源本身），按 (最早污染时刻, chain_id) 升序",
+    )
+    unreached: List[str] = Field(
+        default_factory=list,
+        description="审计截止前未被污染到达的链标识，按 chain_id 字典序排列",
+    )
