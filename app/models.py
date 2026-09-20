@@ -719,3 +719,92 @@ class ContaminationTraceResponse(BaseModel):
         default_factory=list,
         description="审计截止前未被污染到达的链标识，按 chain_id 字典序排列",
     )
+
+
+# ---------------------------------------------------------------------------
+# 保管容量并发审计（/api/v1/seal-chain/custody-capacity-audit）
+# ---------------------------------------------------------------------------
+
+
+class CustodianCapacity(BaseModel):
+    """单个保管人的并发容量：同一时刻最多可同时持有的链数量（正整数）。"""
+
+    custodian: str = Field(min_length=1, description="保管人名称")
+    capacity: int = Field(ge=1, description="该保管人允许同时持有的最大链数，必须为正整数")
+
+
+class CustodyCapacityAuditRequest(BaseModel):
+    """保管容量并发审计请求：多条带 chain_id 的事件链、各保管人容量与审计截止时间。"""
+
+    chains: List[ChainEvents] = Field(
+        default_factory=list,
+        description="事件链，结构同批量校验；chain_id 不可重复",
+    )
+    capacities: List[CustodianCapacity] = Field(
+        default_factory=list,
+        description="各保管人的并发容量（正整数），custodian 不可重复；"
+        "审计窗口内实际持有过链的保管人均须给出容量",
+    )
+    audit_until: datetime = Field(
+        description="审计截止时间；各链末个保管区间延伸至此，"
+        "不得早于任一链最后一个有效事件时间"
+    )
+
+    @model_validator(mode="after")
+    def _chain_id_must_be_unique(self) -> "CustodyCapacityAuditRequest":
+        seen: set[str] = set()
+        for chain in self.chains:
+            if chain.chain_id in seen:
+                raise ValueError(f"批次内 chain_id 不可重复：{chain.chain_id}")
+            seen.add(chain.chain_id)
+        return self
+
+
+class CapacityOverrunSegment(BaseModel):
+    """一段并发数超过保管人容量的半开时间区间 [start, end)。
+
+    相邻（首尾相接）且活跃链集合完全相同的超限段已合并为一段。
+    """
+
+    custodian: str = Field(description="超限保管人")
+    start: datetime = Field(description="超限段起点（含）")
+    end: datetime = Field(description="超限段终点（不含）")
+    seconds: float = Field(description="超限段时长（秒），等于 end - start")
+    capacity: int = Field(description="该保管人的并发容量")
+    concurrency: int = Field(description="该段内该保管人名下同时持有的活跃链数")
+    chain_ids: List[str] = Field(
+        description="该段内并发持有的链标识，按字典序排列"
+    )
+
+
+class CustodianCapacitySummary(BaseModel):
+    """单个保管人的超限时长与并发峰值汇总。"""
+
+    custodian: str = Field(description="保管人")
+    capacity: int = Field(description="该保管人的并发容量")
+    overrun_seconds: float = Field(
+        description="并发数超过容量的累计秒数（全部超限段秒数之和）"
+    )
+    peak_concurrency: int = Field(
+        description="审计窗口内该保管人名下同时持有链数的峰值"
+    )
+
+
+class CustodyCapacityAuditResponse(BaseModel):
+    """保管容量并发审计响应：保留各链单链校验结果，另附超限分段与保管人汇总。"""
+
+    audit_until: datetime = Field(description="回显请求中的审计截止时间")
+    chains: List[BatchChainResult] = Field(
+        description="各链原单链校验结果（按输入顺序，结构同单链接口并附 chain_id）；"
+        "仅以其中 status=ok 的 seal/reseal/handover 生成保管人持有区间"
+    )
+    segments: List[CapacityOverrunSegment] = Field(
+        default_factory=list,
+        description="并发超限分段（半开区间），按 (保管人, 起点) 升序；"
+        "相邻且活跃链集合相同的超限段已合并",
+    )
+    custodians: List[CustodianCapacitySummary] = Field(
+        default_factory=list,
+        description="按保管人字典序排列的超限秒数与并发峰值汇总；"
+        "仅包含审计窗口内实际持有过链的保管人",
+    )
